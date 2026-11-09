@@ -23,6 +23,9 @@ jobs:
           java-version: 21
           cache: maven
 
+      - name: Install Newman
+        run: npm install -g newman
+
       - name: Build and run unit tests
         timeout-minutes: 10
         run: |
