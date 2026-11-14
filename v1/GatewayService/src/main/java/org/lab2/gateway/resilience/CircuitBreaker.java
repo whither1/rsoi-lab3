@@ -1,146 +1,162 @@
 package org.lab2.gateway.resilience;
 
+import org.lab2.gateway.config.AppProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.client.HttpClientErrorException;
-import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClientException;
 
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /**
- * Простой in-memory Circuit Breaker.
+ * Circuit Breaker на основе скользящего временного окна.
  *
- * <p>Пока сервис отвечает, цепь замкнута ({@link State#CLOSED}). После {@code failureThreshold}
- * подряд идущих ошибок цепь размыкается ({@link State#OPEN}) и запросы к реальному сервису не
- * выполняются — сразу возвращается fallback. Через {@code resetTimeoutMillis} цепь переходит в
- * полуоткрытое состояние ({@link State#HALF_OPEN}) и один запрос выполняется для проверки
- * состояния сервиса: успех замыкает цепь, ошибка снова её размыкает.
+ * <p>В состоянии {@link State#CLOSED} все вызовы проходят, а их результаты (успех/отказ и
+ * длительность) пишутся в {@link TimeBasedSlidingWindow}. Когда накопленной статистики достаточно
+ * ({@code minimumNumberOfCalls}) и доля отказов (или медленных вызовов) за окно превышает порог,
+ * цепь размыкается ({@link State#OPEN}).
+ *
+ * <p>В состоянии {@link State#OPEN} вызовы к реальному сервису не выполняются — сразу отдаётся
+ * fallback. Через {@code waitDurationInOpenState} цепь переходит в {@link State#HALF_OPEN} и
+ * пропускает ограниченное число пробных вызовов: если все успешны — цепь замыкается и окно
+ * очищается, иначе цепь снова размыкается.
  */
 public class CircuitBreaker {
 
     private static final Logger log = LoggerFactory.getLogger(CircuitBreaker.class);
-
-    /** Сколько раз пробуем выполнить запрос при ошибках соединения. */
-    private static final int MAX_ATTEMPTS = 4;
-
-    /** Пауза между попытками, мс (даёт пулу соединений выбросить «протухший» коннект). */
-    private static final long RETRY_BACKOFF_MS = 250L;
 
     public enum State {
         CLOSED, OPEN, HALF_OPEN
     }
 
     private final String name;
-    private final int failureThreshold;
-    private final long resetTimeoutMillis;
+    private final TimeBasedSlidingWindow window;
+    private final int minimumNumberOfCalls;
+    private final double failureRateThreshold;
+    private final double slowCallRateThreshold;
+    private final long slowCallDurationMillis;
+    private final long waitDurationInOpenStateMillis;
+    private final int permittedCallsInHalfOpenState;
+    private final LongSupplier clockMillis;
 
     private State state = State.CLOSED;
-    private int consecutiveFailures = 0;
-    private long openedAt = 0L;
+    private long openedAtMillis;
+    private int halfOpenCalls;
+    private int halfOpenFailures;
 
-    public CircuitBreaker(String name, int failureThreshold, long resetTimeoutMillis) {
+    public CircuitBreaker(String name, AppProperties.CircuitBreaker config, LongSupplier clockMillis) {
         this.name = name;
-        this.failureThreshold = failureThreshold;
-        this.resetTimeoutMillis = resetTimeoutMillis;
+        this.clockMillis = clockMillis;
+        this.window = new TimeBasedSlidingWindow(config.getSlidingWindowSize(), clockMillis);
+        this.minimumNumberOfCalls = config.getMinimumNumberOfCalls();
+        this.failureRateThreshold = config.getFailureRateThreshold();
+        this.slowCallRateThreshold = config.getSlowCallRateThreshold();
+        this.slowCallDurationMillis = config.getSlowCallDuration();
+        this.waitDurationInOpenStateMillis = config.getWaitDurationInOpenState();
+        this.permittedCallsInHalfOpenState = config.getPermittedCallsInHalfOpenState();
     }
 
     /**
-     * Выполняет операцию чтения. При разомкнутой цепи сразу возвращает fallback, не обращаясь к
-     * сервису. Ошибки 4xx пробрасываются как есть (сервис ответил, он доступен), а ошибки
-     * недоступности/5xx учитываются как отказ, после чего возвращается fallback.
+     * Операция чтения из критичного источника. При открытой цепи сразу возвращает fallback.
+     * Ответы 4xx пробрасываются как есть (сервис ответил — он доступен), а ошибки
+     * недоступности/5xx учитываются как отказ.
      */
     public <T> T execute(Supplier<T> call, Supplier<T> fallback) {
-        if (!allowRequest()) {
-            log.warn("[{}] circuit OPEN, returning fallback", name);
-            return fallback.get();
-        }
-        try {
-            T result = callWithRetry(call);
-            recordSuccess();
-            return result;
-        } catch (HttpClientErrorException e) {
-            // 4xx — сервис ответил, значит он жив; ответ отдаём клиенту без изменений
-            recordSuccess();
-            throw e;
-        } catch (RestClientException e) {
-            log.warn("[{}] read failed after retries ({}), returning fallback", name, e.toString());
-            recordFailure();
-            return fallback.get();
-        }
+        return executeInternal(call, fallback, true);
     }
 
     /**
-     * Выполняет операцию чтения из некритичного источника: любая ошибка (в том числе 4xx)
-     * заменяется fallback-значением.
+     * Операция чтения из некритичного источника: любая ошибка (в том числе 4xx) заменяется
+     * fallback-значением.
      */
     public <T> T executeLenient(Supplier<T> call, Supplier<T> fallback) {
+        return executeInternal(call, fallback, false);
+    }
+
+    private <T> T executeInternal(Supplier<T> call, Supplier<T> fallback, boolean rethrowClientErrors) {
         if (!allowRequest()) {
-            log.warn("[{}] circuit OPEN, returning fallback", name);
+            log.warn("[{}] circuit {}, returning fallback", name, state);
             return fallback.get();
         }
+        long start = clockMillis.getAsLong();
         try {
-            T result = callWithRetry(call);
-            recordSuccess();
+            T result = call.get();
+            recordResult(false, clockMillis.getAsLong() - start);
             return result;
-        } catch (RestClientException e) {
-            log.warn("[{}] read failed after retries ({}), returning fallback", name, e.toString());
-            recordFailure();
-            return fallback.get();
-        }
-    }
-
-    /**
-     * После перезапуска downstream-сервиса пул соединений клиента может содержать «протухшее»
-     * keep-alive соединение. Несколько повторных попыток с небольшой паузой позволяют прозрачно
-     * переустановить соединение. Число попыток не влияет на статистику отказов — она учитывается
-     * один раз на вызов.
-     */
-    private <T> T callWithRetry(Supplier<T> call) {
-        ResourceAccessException last = null;
-        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-            try {
-                return call.get();
-            } catch (ResourceAccessException e) {
-                last = e;
-                log.warn("[{}] connection error on attempt {}/{}: {}", name, attempt, MAX_ATTEMPTS, e.toString());
-                sleep();
+        } catch (HttpClientErrorException e) {
+            // 4xx — сервис ответил, значит он жив; это не отказ доступности
+            recordResult(false, clockMillis.getAsLong() - start);
+            if (rethrowClientErrors) {
+                throw e;
             }
-        }
-        throw last;
-    }
-
-    private void sleep() {
-        try {
-            Thread.sleep(RETRY_BACKOFF_MS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            return fallback.get();
+        } catch (RestClientException e) {
+            recordResult(true, clockMillis.getAsLong() - start);
+            return fallback.get();
         }
     }
 
     private synchronized boolean allowRequest() {
         if (state == State.OPEN) {
-            if (System.currentTimeMillis() - openedAt >= resetTimeoutMillis) {
-                state = State.HALF_OPEN;
-                return true;
+            if (clockMillis.getAsLong() - openedAtMillis < waitDurationInOpenStateMillis) {
+                return false;
             }
-            return false;
+            state = State.HALF_OPEN;
+            halfOpenCalls = 0;
+            halfOpenFailures = 0;
+            log.info("[{}] circuit HALF_OPEN, probing downstream", name);
+        }
+        if (state == State.HALF_OPEN) {
+            if (halfOpenCalls >= permittedCallsInHalfOpenState) {
+                return false;
+            }
+            halfOpenCalls++;
         }
         return true;
     }
 
-    private synchronized void recordSuccess() {
-        state = State.CLOSED;
-        consecutiveFailures = 0;
+    private synchronized void recordResult(boolean failed, long durationMillis) {
+        window.record(failed, durationMillis >= slowCallDurationMillis);
+
+        if (state == State.HALF_OPEN) {
+            if (failed) {
+                halfOpenFailures++;
+            }
+            if (halfOpenCalls >= permittedCallsInHalfOpenState) {
+                completeHalfOpen();
+            }
+            return;
+        }
+
+        if (state == State.CLOSED && shouldOpen()) {
+            open();
+        }
     }
 
-    private synchronized void recordFailure() {
-        consecutiveFailures++;
-        if (state == State.HALF_OPEN || consecutiveFailures >= failureThreshold) {
-            state = State.OPEN;
-            openedAt = System.currentTimeMillis();
-            log.warn("[{}] circuit OPEN after {} consecutive failures", name, consecutiveFailures);
+    private boolean shouldOpen() {
+        TimeBasedSlidingWindow.Metrics metrics = window.metrics();
+        if (metrics.calls() < minimumNumberOfCalls) {
+            return false;
         }
+        return metrics.failureRatePercent() >= failureRateThreshold
+                || metrics.slowCallRatePercent() >= slowCallRateThreshold;
+    }
+
+    private void completeHalfOpen() {
+        if (halfOpenFailures == 0) {
+            state = State.CLOSED;
+            window.reset();
+            log.info("[{}] circuit CLOSED after successful probes", name);
+        } else {
+            open();
+        }
+    }
+
+    private void open() {
+        state = State.OPEN;
+        openedAtMillis = clockMillis.getAsLong();
+        log.warn("[{}] circuit OPEN (failure rate over sliding window exceeded)", name);
     }
 
     public synchronized State getState() {

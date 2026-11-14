@@ -3,6 +3,8 @@ package org.lab2.gateway.resilience;
 import org.lab2.gateway.config.AppProperties;
 import org.springframework.stereotype.Component;
 
+import java.util.function.LongSupplier;
+
 /**
  * Хранит по одному Circuit Breaker на каждый downstream-сервис.
  */
@@ -14,11 +16,11 @@ public class CircuitBreakerRegistry {
     private final CircuitBreaker bonus;
 
     public CircuitBreakerRegistry(AppProperties properties) {
-        int threshold = properties.getCircuitBreaker().getThreshold();
-        long resetTimeout = properties.getCircuitBreaker().getResetTimeout();
-        this.flight = new CircuitBreaker("flight", threshold, resetTimeout);
-        this.ticket = new CircuitBreaker("ticket", threshold, resetTimeout);
-        this.bonus = new CircuitBreaker("bonus", threshold, resetTimeout);
+        LongSupplier clockMillis = System::currentTimeMillis;
+        AppProperties.CircuitBreaker config = properties.getCircuitBreaker();
+        this.flight = new CircuitBreaker("flight", config, clockMillis);
+        this.ticket = new CircuitBreaker("ticket", config, clockMillis);
+        this.bonus = new CircuitBreaker("bonus", config, clockMillis);
     }
 
     public CircuitBreaker flight() {
